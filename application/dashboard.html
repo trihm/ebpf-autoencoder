@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<title>eBPF dual-AE — detector near realtime</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 20px;
+         background: #0f1115; color: #e6e6e6; }
+  h1 { font-size: 18px; font-weight: 500; margin: 0 0 16px; }
+  .cards { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+  .card { background: #171a21; border: 1px solid #262b35; border-radius: 10px;
+          padding: 12px 16px; min-width: 150px; }
+  .card .label { font-size: 12px; color: #9aa3b2; }
+  .card .value { font-size: 22px; margin-top: 4px; }
+  .ok { color: #58c98f; } .warn { color: #e6b450; } .bad { color: #e26a6a; }
+  #chartWrap { background: #171a21; border: 1px solid #262b35; border-radius: 10px;
+               padding: 12px; margin-bottom: 18px; height: 300px; }
+  table { width: 100%; border-collapse: collapse; background: #171a21;
+          border: 1px solid #262b35; border-radius: 10px; overflow: hidden; }
+  th, td { text-align: left; padding: 9px 12px; font-size: 13px;
+           border-bottom: 1px solid #222731; }
+  th { color: #9aa3b2; font-weight: 500; }
+  tr.live td:first-child { border-left: 3px solid #e26a6a; }
+  code { color: #9ecbff; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>Detector dual-AE — near realtime</h1>
+
+<div class="cards">
+  <div class="card"><div class="label">Trạng thái sensor</div>
+    <div class="value" id="sensor">—</div></div>
+  <div class="card"><div class="label">Độ trễ pipeline</div>
+    <div class="value" id="lag">—</div></div>
+  <div class="card"><div class="label">Cửa sổ đã chấm</div>
+    <div class="value" id="windows">0</div></div>
+  <div class="card"><div class="label">Alert</div>
+    <div class="value" id="alerts">0</div></div>
+  <div class="card"><div class="label">Incident đang mở</div>
+    <div class="value" id="open">0</div></div>
+</div>
+
+<div id="chartWrap"><canvas id="chart"></canvas></div>
+
+<table>
+  <thead><tr>
+    <th>Source</th><th>Bắt đầu</th><th>Kéo dài</th><th>Cửa sổ</th>
+    <th>Score</th><th>Nhánh</th><th>Feature nổi bật</th>
+  </tr></thead>
+  <tbody id="rows"><tr><td colspan="7" style="color:#9aa3b2">Chưa có incident.</td></tr></tbody>
+</table>
+
+<script>
+const WINDOW_SEC = 5;
+const open = new Map(), closed = [];
+const hms = t => new Date(t * 1000).toLocaleTimeString('vi-VN', { hour12: false });
+
+const chart = new Chart(document.getElementById('chart'), {
+  type: 'line',
+  data: { labels: [], datasets: [
+    { label: 'network (err/thr)', data: [], borderColor: '#5aa9e6', pointRadius: 0, tension: .25, borderWidth: 1.6 },
+    { label: 'process (err/thr)', data: [], borderColor: '#c792ea', pointRadius: 0, tension: .25, borderWidth: 1.6 },
+    { label: 'ngưỡng', data: [], borderColor: '#e26a6a', borderDash: [5, 4], pointRadius: 0, borderWidth: 1 }
+  ]},
+  options: {
+    responsive: true, maintainAspectRatio: false, animation: false,
+    scales: { y: { beginAtZero: true, grid: { color: '#222731' }, ticks: { color: '#9aa3b2' } },
+              x: { grid: { display: false }, ticks: { color: '#9aa3b2', maxTicksLimit: 10 } } },
+    plugins: { legend: { labels: { color: '#c9d1d9', boxWidth: 14 } } }
+  }
+});
+
+function pushPoint(p) {
+  const d = chart.data;
+  d.labels.push(hms(p.window_start));
+  d.datasets[0].data.push(p.max_norm_net);
+  d.datasets[1].data.push(p.max_norm_proc);
+  d.datasets[2].data.push(1);
+  if (d.labels.length > 240) { d.labels.shift(); d.datasets.forEach(s => s.data.shift()); }
+  document.getElementById('lag').textContent = p.lag + ' s';
+  document.getElementById('lag').className = 'value ' + (p.lag > 10 ? 'bad' : p.lag > 8 ? 'warn' : 'ok');
+  chart.update('none');
+}
+
+function renderTable() {
+  const all = [...open.values()].map(i => ({ ...i, live: true })).concat(closed);
+  all.sort((a, b) => b.end_ts - a.end_ts);
+  const tb = document.getElementById('rows');
+  if (!all.length) { tb.innerHTML = '<tr><td colspan="7" style="color:#9aa3b2">Chưa có incident.</td></tr>'; return; }
+  tb.innerHTML = all.slice(0, 40).map(i => `
+    <tr class="${i.live ? 'live' : ''}">
+      <td><code>${i.src_ip}</code></td>
+      <td>${hms(i.start_ts)}</td>
+      <td>${Math.round(i.end_ts - i.start_ts)}s</td>
+      <td>${i.n_windows}</td>
+      <td>${i.max_score.toFixed(2)}</td>
+      <td>${i.trigger || '—'}</td>
+      <td><code>${(i.top || []).map(f => f.feature).join(', ')}</code></td>
+    </tr>`).join('');
+  document.getElementById('open').textContent = open.size;
+}
+
+function applyStats(s) {
+  document.getElementById('windows').textContent = s.windows;
+  document.getElementById('alerts').textContent = s.alerts;
+}
+
+async function boot() {
+  const r = await fetch('/api/history').then(x => x.json());
+  r.history.forEach(pushPoint);
+  r.open_incidents.forEach(i => open.set(i.src_ip, i));
+  closed.push(...r.closed_incidents);
+  applyStats(r.stats);
+  renderTable();
+
+  const es = new EventSource('/events');
+  es.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.type === 'window') {
+      pushPoint(m.data);
+      applyStats({ windows: +document.getElementById('windows').textContent + 1,
+                   alerts: +document.getElementById('alerts').textContent + m.data.n_alerts });
+    } else if (m.type === 'incident') {
+      open.set(m.data.src_ip, m.data); renderTable();
+    } else if (m.type === 'incident_closed') {
+      open.delete(m.data.src_ip); closed.unshift(m.data); renderTable();
+    }
+  };
+  es.onerror = () => { document.getElementById('sensor').textContent = 'mất kết nối'; };
+}
+
+setInterval(async () => {
+  const h = await fetch('/api/health').then(x => x.json()).catch(() => null);
+  if (!h) return;
+  const el = document.getElementById('sensor');
+  const stale = v => v === null || v > 30;
+  if (stale(h.net_event_age_s) && stale(h.proc_event_age_s)) { el.textContent = 'cả hai im'; el.className = 'value bad'; }
+  else if (stale(h.net_event_age_s)) { el.textContent = 'thiếu Hubble'; el.className = 'value warn'; }
+  else if (stale(h.proc_event_age_s)) { el.textContent = 'thiếu Tetragon'; el.className = 'value warn'; }
+  else { el.textContent = 'bình thường'; el.className = 'value ok'; }
+}, 5000);
+
+boot();
+</script>
+</body>
+</html>
